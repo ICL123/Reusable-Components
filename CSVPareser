@@ -1,0 +1,570 @@
+/**
+ * @Use: To make Terminal_POS__c & Contact Address Records from a CSV, when it uploaded
+ */
+public with sharing class CSVParser_es{
+
+    public static String csvContent;
+    public static String accountId;
+    public static Map<String, Integer> fieldApiIndexMap;
+    public static List<String> addressNumbers = new List<String>();
+    public static List<String> paymentAddressNumbers = new List<String>();
+    public static List<String> subscriptionNumbers = new List<String>();
+
+    @AuraEnabled
+    public static Contract getContract(String contractId){
+        List<Contract> cont = [select Is_Client_Contract__c from contract where Id = :contractId];
+        return cont.size()>0 ? cont[0] : null;
+    }
+
+    /**
+     * @Use: This functional will be called from the LWC cmp. It will receive CSV as a string
+     * @Params: String csvContent, String SobjectApi, String recordId
+     * @Output: Map<String, String> {'success': '...', 'error': '...'}
+     */
+    @AuraEnabled
+    public static Map<String, String> loadCSVs(String csvContent, String sobjectApi, String recordId) {
+        //System.debug(csvContent);
+        csvContent = EncodingUtil.base64Decode(EncodingUtil.urlDecode(csvContent, 'UTF-8')).toString();
+
+        if(sobjectApi == 'Contract_Address__c'){
+            List<Contract> contracts = [
+                SELECT
+                    AccountId
+                FROM
+                    Contract
+                WHERE
+                    Id = :recordId
+                WITH SECURITY_ENFORCED
+            ];
+            if (contracts.size() > 0){
+                accountId = contracts[0].AccountId;
+            }
+        }
+
+        Map<String, String> resultMap =  processCSV(
+            csvContent,
+            getCSVHeaderApiMap(SobjectApi),
+            sobjectApi,
+            recordId
+        );
+
+        return resultMap;
+    }
+
+
+    /**
+     * Helper functions
+     */
+
+    /**
+     * @Use: Return Field Api & CSV Mappings
+     */
+    public static Map<String, String> getCSVHeaderApiMap(String sobjectApi) {
+
+        Map<String, String> headerFieldMap;
+        if(sobjectApi == 'Terminal_POS__c') {
+
+            headerFieldMap = new Map<String, String>{
+                'Bank Name *' => 'Bank_Name_es__c',
+                'MID' => 'MID_es__c',
+                'TID' => 'TID_es__c',
+                'Acquirer Name' => 'Acquirer_Name__c',
+                'Hardware ID' => 'Hardware_ID__c',
+                'Outlet Address *' => 'Outlet_Address__c',
+                'POS ID' => 'POS_ID__c',
+                'Subscription' => 'Subscription_Number_es__c'
+            };
+        }
+        else if(sobjectApi == 'Contract_Address__c') {
+            headerFieldMap = new Map<String, String>{
+                'Contract' => 'Contract__c',
+                'Contract Address Name*' => 'Name',
+                'Address' => 'Address_Number__c'
+            };
+        }
+        else if(sobjectApi == 'Address__c') {
+            headerFieldMap = new Map<String, String>{
+                'Address' => 'Address_Number__c',
+                'Account' => 'Account__c',
+                'Location Name*' => 'Location_Name__c',
+                'Address Line 1*' => 'Address_Line_1__c',
+                'Address Line 2*' => 'Address_Line_2__c',
+                'Address Line 3*' => 'Address_Line_3__c',
+                'Area*' => 'Area__c',
+                'Sodexo Line Of Business' => 'Line_Of_Business__c',
+                'City*' => 'City__c',
+                'State/Province*' => 'State_Province_New__c',
+                'Zip/ Postal Code*' => 'Zip_Postal_Code__c',
+                'GST Customer Type*' => 'GST_Customer_Type__c',
+                'GST Registration No' => 'GST_Registration_No__c',
+                'GST Registration Type*' => 'GST_Registration_Type__c',
+                'TAN No' => 'TAN_Number__c',
+                'Type Of Address*' => 'Type_Of_Address__c',
+                'Is Active*' => 'Active__c',
+                'Mobile No*' => 'Mobile_Number__c',
+                'Contact No*' => 'Telephone_es__c',
+                'Email Id*' => 'Email_To__c',
+                'PAYMENT POINT FLAG*' => 'Payment_Point_Flag__c',
+                'Parent Payment Address' => 'Parent_Payment_Address_Name__c',
+                'Invoice / Outlet Name*' => 'Invoice_Name_es__c',
+                'Outlet Name*'=> 'Outlet_Name_es__c',
+                'Contact Person Name*' => 'Contact_Person_Name_es__c',
+                'Name On Cheque*' => 'Name_on_Cheque_es__c'
+            };
+        }
+
+        return headerFieldMap;
+    }
+
+    /**
+     * @Use: get map of field API name and its index in CSV file 
+     */
+    public static Map<String, Integer> getFieldApiIndexMap(String sobjectApi, String[] headers) {
+        Map<String, String> csvHeaderApiMap = getCSVHeaderApiMap(sobjectApi);
+        Map<String, Integer> fieldApiIndexMap = new Map<String, Integer>();
+        for(Integer i = 0; i < headers.size(); i++) {
+
+            String headerItr;
+            if(i == 0) {
+
+                if(headers[i].contains('\uFEFF')) {
+                    headerItr =
+                    headers[i].split('\uFEFF')[1];
+                }
+                else {
+                    headerItr =
+                    headers[i];
+                }
+
+            }
+            else {
+
+                headerItr =
+                    headers[i].remove('\n').remove('\r').remove('\r\n')
+                    .escapeUnicode().escapeCsv()
+                    .remove('\uFEFF').replace('\uFEFF', '');
+            }
+
+
+            if(csvHeaderApiMap != NULL && csvHeaderApiMap.get(headerItr) != NULL) {
+                fieldApiIndexMap.put(csvHeaderApiMap.get(headerItr), i);
+            }
+        }
+
+        return fieldApiIndexMap;
+    }
+
+
+    /**
+     * @Use: Return Sobject Records for Load
+     * @Params: csvContent , csvHeaderApiMap
+     */
+    public static Map<String, String> processCSV(
+        String csvContent,
+        Map<String, String> csvHeaderApiMap,
+        String sobjectApi,
+        String recordId) {
+
+        System.debug('processCSV');
+        List<Sobject> posTerminalRecords = new List<Sobject>();
+        List<Sobject> addressRecords = new List<Sobject>();
+        List<Sobject> contractAddressRecords = new List<Sobject>();
+        Map<String, String> resultMap = new Map<String, String>();
+
+        List<String> rows = csvContent.split('\r\n');
+
+        Map<String, Integer> fieldApiIndexMap = getFieldApiIndexMap(sobjectApi, rows[0].split(','));
+        System.debug(fieldApiIndexMap);
+        System.debug(rows);
+        System.debug(rows.size());
+        for(Integer i = 1; i < rows.size(); i++) {
+            System.debug('line 164' + sobjectApi);
+            if(sobjectApi == 'Terminal_POS__c') {
+                System.debug('line 165');
+                posTerminalRecords.add(
+                    processRow(fieldApiIndexMap, rows[i].escapeJava().remove('\r'), sobjectApi, recordId)
+                );
+            }
+            else if(sobjectApi == 'Contract_Address__c') {
+                Map<String, Integer> fieldApiIndexMapForAddress = getFieldApiIndexMap('Address__c', rows[0].split(','));
+                addressRecords.add(
+                    processRow(fieldApiIndexMapForAddress, rows[i].escapeJava().remove('\r'), 'Address__c', recordId)
+                );
+
+                contractAddressRecords.add(
+                    processRow(fieldApiIndexMap, rows[i].escapeJava().remove('\r'), sobjectApi, recordId)
+                );
+            }
+        }
+
+        if(sobjectApi == 'Terminal_POS__c') {
+            populateSubscriptionIdFromNumber(posTerminalRecords);
+            Database.UpsertResult[] posResults = Database.upsert(posTerminalRecords, false);
+            resultMap = generateResultCSVs(posResults, sobjectApi, rows);
+
+            System.debug(rows[0]);
+
+            String errors = rows[0]  + ',Errors\r\n'+ resultMap.get('errors');
+            resultMap.put('errors', errors);
+
+            String successes = rows[0]  + ',RecordId\r\n'+ resultMap.get('successes');
+            resultMap.put('successes', successes);
+
+            System.debug('errors'+ errors);
+            System.debug('successes'+ successes);
+        }
+        else if(sobjectApi == 'Contract_Address__c') {
+            populateAddressIdsFromNumber(addressRecords, addressNumbers);
+            System.debug('address records ===>' + addressRecords);
+
+            populateAddressIdsFromNumber(addressRecords, paymentAddressNumbers);
+
+            System.debug('address records ===>' + addressRecords);
+            List<String> addressRecordsWithId = new List<String>(addressRecords.size());
+            populateExistingIds(addressRecordsWithId, addressRecords);
+            System.debug('address records ===>' + addressRecords);
+
+            
+            Set<Sobject> addressRecords1 = new Set<Sobject>(addressRecords);
+            List<Sobject> addressRecords2 = new List<Sobject>(addressRecords1);
+
+            Database.UpsertResult[] addressRecordResults = Database.upsert(addressRecords2, false);
+            populateNewIds(addressRecordResults, addressRecordsWithId);
+
+            generateResultCSVs(addressRecordResults, sobjectApi, rows);
+            updateAddressIds(addressRecordsWithId, contractAddressRecords);
+            
+            Database.UpsertResult[] contractAddressRecordResults = Database.upsert(contractAddressRecords, false);
+            resultMap = generateResultCSVs(contractAddressRecordResults, sobjectApi, rows);
+
+            String errors = rows[0]  + ',Address Errors,Contract Address Errors\n'+ resultMap.get('errors');
+            resultMap.put('errors', errors);
+            
+            String successes = rows[0]  + ',RecordId\n'+ resultMap.get('successes');
+            resultMap.put('successes', successes);
+            
+        }
+
+        return resultMap;
+    }
+
+    public static void populateSubscriptionIdFromNumber(List<Sobject> posTerminalRecords){
+        System.debug('subscriptionNumbers ===>'+ subscriptionNumbers);
+        List<SBQQ__Subscription__c> subscriptions = [select Id, Name from SBQQ__Subscription__c 
+        where Name in :subscriptionNumbers];
+        Map<String, String> nameIdMap = new Map<String, String>();
+        for (SBQQ__Subscription__c subscription : subscriptions){
+            nameIdMap.put(subscription.Name, subscription.Id);
+        }
+
+        for (Sobject pos : posTerminalRecords){
+            if ( pos.get('Subscription_Number_es__c') != null){
+                pos.put('Subscription__c', nameIdMap.get(pos.get('Subscription_Number_es__c').toString()));
+            }
+        }
+    }
+
+    /**
+     * @Use: Populate Address Id by using Address Number i.e. record Name in CSV file
+     */
+    public static void populateAddressIdsFromNumber(List<Sobject> addressRecords, List<String> addressNumbers){
+        List<Address__c> addresses = [
+                                    SELECT
+                                        Id, 
+                                        Name
+                                    FROM 
+                                        Address__c
+                                    WHERE 
+                                        Name in :addressNumbers
+                                    WITH
+                                        SECURITY_ENFORCED];
+        
+        System.debug(addressRecords);
+        System.debug(addressNumbers);
+
+        Map<String, String> nameIdMap = new Map<String, String>();
+        for (Address__c address : addresses){
+            nameIdMap.put(address.Name, address.Id);
+        }
+
+        for (Sobject address : addressRecords){
+            System.debug('address.get(Parent_Payment_Address_Name__c)' + address.get('Parent_Payment_Address_Name__c'));
+
+            if (address != null && address.id == null && address.get('Address_Number__c') != null){
+                address.Id = nameIdMap.get(address.get('Address_Number__c').toString());
+            }
+            if (address.get('Parent_Payment_Address_Name__c') != null){
+                System.debug('name present ====>'+ nameIdMap.get(address.get('Parent_Payment_Address_Name__c').toString()));
+                address.put('Parent_Payment_Address__c', nameIdMap.get(address.get('Parent_Payment_Address_Name__c').toString()));
+            }
+        }
+    }
+
+    /**
+     * @Use: create a list of IDs of Addresses which are already present in org, 
+     *       and are to be attached to contract address
+     */
+    public static void populateExistingIds(
+        List<String> addressRecordsWithId,
+        List<Sobject> addressRecords) {
+
+        for (Integer i = 0; i < addressRecords.size(); i++){
+            if (addressRecords[i] != null && String.isNotBlank(addressRecords[i].id)){
+                addressRecordsWithId[i] = addressRecords[i].id;
+            }
+        }
+    }
+
+    /**
+     * @Use: create a list of IDs of Addresses which are created now by using data in CSV,
+     *       and are to be attached to contract address
+     */
+    public static void populateNewIds(
+        Database.UpsertResult[] addressRecordResults,
+        List<String> addressRecordsWithId) {
+
+        for (Integer i=0; i < addressRecordResults.size(); i++){
+            if (!addressRecordsWithId.contains(String.valueOf(addressRecordResults[i].getId()))){
+                addressRecordsWithId[addressRecordsWithId.indexOf(null)] = 
+                        String.valueOf(addressRecordResults[i].getId());
+            }
+        }
+    }
+
+    /**
+     * @Use: populate both existing and newly created AddressIds in lookup field  of contractAddress
+     */
+    public static void updateAddressIds(
+        List<String> addressRecordResults,
+        Sobject[] contractAddressRecordResults) {
+
+        for(Integer i = 0; i < contractAddressRecordResults.size(); i++) {
+            contractAddressRecordResults[i].put('Address__c', addressRecordResults[i]);
+        }
+    }
+
+    /**
+     * @Use: Return Sobject Records for Load
+     * @Params: csvContent , csvHeaderApiMap
+     */
+    public static Map<String, String> generateResultCSVs(
+        Database.UpsertResult[] results,
+        String sobjectApi,
+        List<String> rows
+        ) {
+
+        String success='';
+        String error='';
+
+        Integer successCount = 0;
+        Integer errorsCount = 0;
+
+        System.debug('results ===>'+ results);
+
+        for(Integer i = 0; i < results.size(); i++) {
+            if (results[i].isSuccess()) {
+
+                if(sobjectApi == 'Address__c'){
+                    success += rows[i+1]+',';
+                }
+                else{
+                    success += rows[i+1]+','+results[i].getId()+'\r\n';
+                }
+
+                successCount += 1;
+            }
+            else {
+
+                String errorMsg = '';
+                for(Database.Error err : results[i].getErrors()) {
+
+                    errorMsg += err.getMessage() + ' - ' + err.getFields() + ';';
+                }
+
+                System.debug('line 347===> '+rows[i+1]);
+                
+                error += rows[i+1] +','+ errorMsg + '\r\n';
+                rows[i+1] += ','+errorMsg;
+
+                System.debug('line 352===> '+rows[i+1]);
+
+                errorsCount += 1;
+            }
+        }
+
+        Map<String, String> processedCsvStrings = new Map<String, String>{
+            'successes' => success,
+            'errors' => error,
+            'successCount' => String.valueOf(successCount),
+            'errorsCount' => String.valueOf(errorsCount)
+        };
+
+        return processedCsvStrings;
+    }
+
+    /**
+     * @Use: Generates an Sobject Record from the Csv row passed onto the function
+     * @Params: csvContent , csvHeaderApiMap
+     */
+    public static Sobject processRow(
+        Map<String, Integer> fieldApiIndexMap,
+        String row,
+        String sObjectApi,
+        String recordId) {
+        System.debug('line 371');
+        /**
+         * Generate a CSV record from the Row
+         */
+        String[] appColumnValues = getAppColumnValues(row);
+        Sobject rowRecord = populateAppropriateFields(appColumnValues, fieldApiIndexMap, sObjectApi, recordId);
+
+        return rowRecord;
+    }
+
+    /**
+     * @Use: generate appropriate column wise contect in a String List
+     */
+    public static String[] getAppColumnValues(String row) {
+
+        List<String> fields = row.split(',');
+        List<String> cleanFields = new List<String>();
+        String compositeField;
+        Boolean makeCompositeField = false;
+
+        for ( String field : fields ) {
+
+            if (field.startsWith('"') && field.endsWith('"')) {
+
+                cleanFields.add(field.replaceAll('DBLQT','"'));
+            }
+            else if (field.startsWith('"')) {
+
+                makeCompositeField = true;
+                compositeField = field;
+            }
+            else if (field.endsWith('"')) {
+
+                compositeField += ',' + field;
+                cleanFields.add(compositeField.replaceAll('DBLQT','"'));
+                makeCompositeField = false;
+            }
+            else if (makeCompositeField) {
+
+                compositeField += ',' + field;
+            }
+            else {
+
+                cleanFields.add(field.replaceAll('DBLQT','"'));
+            }
+        }
+
+        //String headerRow = cleanFields[0];
+
+        return cleanFields;
+    }
+
+
+    /**
+     * @Use: Returns List<Sobject> for Insertion
+     * @Params: String sobjectApi, Map<String, String> csvHeaderApiMap, String csvContent, String recordId
+     */
+    public static Sobject populateAppropriateFields(
+        String[] appColumnValues,
+        Map<String, Integer>  fieldApiIndexMap,
+        String sObjectApi,
+        String recordId) {        
+
+        Sobject rowRecord;
+        if(sObjectApi == 'Terminal_POS__c') {
+
+            rowRecord = new Terminal_POS__c(Contract__c = recordId);
+        }
+        else if(sObjectApi == 'Contract_Address__c') {
+
+            rowRecord = new Contract_Address__c(Contract__c = recordId);
+        }
+        else if(sObjectApi == 'Address__c') {
+            rowRecord = new Address__c(Account__c = accountId, From_CSV__c = true);
+            //rowRecord.From_CSV__c = True;
+        }
+        if(appColumnValues != NULL && appColumnValues.size() > 0) {
+            for(String fieldAPi : fieldApiIndexMap.keySet()) {
+                if(appColumnValues.size() > fieldApiIndexMap.get(fieldAPi) && 
+                        String.isNotBlank(appColumnValues[fieldApiIndexMap.get(fieldAPi)]) ) {
+
+                    rowRecord = createObject(rowRecord, appColumnValues, fieldApiIndexMap, fieldAPi);
+                }
+            }
+        }
+
+        sObject newRecord = removeIrrelevantFields(rowRecord, sObjectApi);
+
+        return newRecord;
+    }
+
+    /**
+     * @Use: 1) create object using column values and row values
+     *       2) logic for isActive field on Address
+     *       (bcoz if isActive field is not checked, then that Address cannot be attached to contractAddress)
+     *       3) create a List of AddressNumbers from CSV
+     */
+    public static sObject createObject(
+        sObject rowRecord, 
+        String[] appColumnValues, 
+        Map<String, Integer>  fieldApiIndexMap, 
+        String fieldAPi ) {
+
+        System.debug('rowRecord ==>' + rowRecord);
+        System.debug('appColumnValues ==>' + appColumnValues);
+        System.debug('fieldApiIndexMap ==>' + fieldApiIndexMap);
+        System.debug('fieldAPi ==>' + fieldAPi);
+
+        if(fieldAPi == 'Active__c'){
+            if(appColumnValues[fieldApiIndexMap.get(fieldAPi)].toLowercase() == 'false'){
+                rowRecord.put(fieldAPi, false);
+            } 
+            else {
+                rowRecord.put(fieldAPi, true);
+            }
+        }
+        else if (fieldAPi == 'Address_Number__c'){
+            addressNumbers.add(appColumnValues[fieldApiIndexMap.get(fieldAPi)]);
+            rowRecord.put(fieldAPi, appColumnValues[fieldApiIndexMap.get(fieldAPi)]);
+        }
+        else if (fieldAPi == 'Parent_Payment_Address_Name__c'){
+            paymentAddressNumbers.add(appColumnValues[fieldApiIndexMap.get(fieldAPi)]);
+            rowRecord.put(fieldAPi, appColumnValues[fieldApiIndexMap.get(fieldAPi)]);
+        }
+        else if (fieldAPi == 'Subscription_Number_es__c'){
+            subscriptionNumbers.add(appColumnValues[fieldApiIndexMap.get(fieldAPi)]);
+            rowRecord.put(fieldAPi, appColumnValues[fieldApiIndexMap.get(fieldAPi)]);
+        }
+        else {
+            rowRecord.put(fieldAPi, appColumnValues[fieldApiIndexMap.get(fieldAPi)]);
+        }
+        
+        return rowRecord;
+    }
+
+    /**
+     * @Use: remove fields from object which are not required
+     */
+    public static sObject removeIrrelevantFields(sObject rowRecord, String sObjectApi){
+        
+        if (sObjectApi == 'Address__c' && rowRecord.get('Address_Number__c') != null){
+
+            Address__c record = new Address__c(Address_Number__c = (String)rowRecord.get('Address_Number__c'));
+            return record;
+        } 
+        else if (sObjectApi == 'Address__c' && 
+                    String.isBlank(rowRecord.id) && 
+                        rowRecord.get('Active__c') == null ){
+                            
+            rowRecord.put('Active__c', true);
+            return rowRecord;
+        }
+        else {
+            return rowRecord;
+        }
+    }
+}
